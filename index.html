@@ -9,7 +9,8 @@
 <meta name="apple-mobile-web-app-status-bar-style" content="default">
 <meta name="apple-mobile-web-app-title" content="项目管理看板">
 <meta name="theme-color" content="#f6f8fb">
-<script src="https://cdn.jsdelivr.net/npm/leancloud-storage@4/dist/av-min.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.14.1/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.14.1/firebase-firestore-compat.js"></script>
 <style>
 /* ========== CSS Variables ========== */
 :root {
@@ -930,27 +931,32 @@ const STORAGE_KEY = 'kanban_board_v3';
 const STATUS_LABELS = { todo: '待办', progress: '进行中', done: '已完成' };
 const ROLE_LABELS = { manager: '项目主管', implementer: '实施人员' };
 
-// ===================== LEANCLOUD CLOUD SYNC =====================
-// 去 leancloud.cn 免费注册 → 创建应用 → 设置 → 应用 Keys 复制下面三项
-const LC_CONFIG = {
-  appId: 'YOUR_LEANCLOUD_APP_ID',
-  appKey: 'YOUR_LEANCLOUD_APP_KEY',
-  serverURL: 'https://YOUR_LC_ID.lc-cn-n1-shared.com'
+// ===================== FIREBASE FIRESTORE CLOUD SYNC =====================
+// 去 console.firebase.google.com 创建项目 → 项目设置 → 添加 Web 应用 → 复制配置
+const FIREBASE_CONFIG = {
+  apiKey: 'YOUR_API_KEY',
+  authDomain: 'YOUR_PROJECT.firebaseapp.com',
+  projectId: 'YOUR_PROJECT_ID',
+  storageBucket: 'YOUR_PROJECT.appspot.com',
+  messagingSenderId: 'YOUR_SENDER_ID',
+  appId: 'YOUR_APP_ID'
 };
 
-let lcReady = false;
+let fbReady = false;
+let fbDB = null;
 let syncStatus = 'local'; // 'local' | 'syncing' | 'online' | 'offline'
 
-function initLC() {
-  if (!LC_CONFIG.appId || LC_CONFIG.appId.startsWith('YOUR_')) {
-    console.log('[Sync] 未配置 LeanCloud，仅本地存储');
+function initFB() {
+  if (!FIREBASE_CONFIG.apiKey || FIREBASE_CONFIG.apiKey === 'YOUR_API_KEY') {
+    console.log('[Sync] 未配置 Firebase，仅本地存储');
     updateSyncUI();
     return;
   }
   try {
-    AV.init({ appId: LC_CONFIG.appId, appKey: LC_CONFIG.appKey, serverURL: LC_CONFIG.serverURL });
-    lcReady = true;
-    console.log('[Sync] LeanCloud 已就绪');
+    firebase.initializeApp(FIREBASE_CONFIG);
+    fbDB = firebase.firestore();
+    fbReady = true;
+    console.log('[Sync] Firebase Firestore 已就绪');
   } catch(e) {
     console.warn('[Sync] 初始化失败:', e.message);
   }
@@ -958,15 +964,12 @@ function initLC() {
 }
 
 async function cloudPull() {
-  if (!lcReady) return null;
+  if (!fbReady) return null;
   try {
     syncStatus = 'syncing'; updateSyncUI();
-    const q = new AV.Query('KanbanData');
-    q.equalTo('syncKey', 'main');
-    q.descending('updatedAt');
-    const row = await q.first();
-    if (row && row.get('payload')) {
-      try { return JSON.parse(row.get('payload')); }
+    const doc = await fbDB.collection('kanbanData').doc('main').get();
+    if (doc.exists && doc.data().payload) {
+      try { return JSON.parse(doc.data().payload); }
       catch(_) { return null; }
     }
     return null;
@@ -980,17 +983,12 @@ async function cloudPull() {
 }
 
 async function cloudPush(data) {
-  if (!lcReady) return;
+  if (!fbReady) return;
   try {
-    const q = new AV.Query('KanbanData');
-    q.equalTo('syncKey', 'main');
-    let row = await q.first();
-    if (!row) {
-      row = new AV.Object('KanbanData');
-      row.set('syncKey', 'main');
-    }
-    row.set('payload', JSON.stringify(data));
-    await row.save();
+    await fbDB.collection('kanbanData').doc('main').set({
+      payload: JSON.stringify(data),
+      updatedAt: firebase.firestore.FieldValue.serverTimestamp()
+    }, { merge: true });
     syncStatus = 'online'; updateSyncUI();
   } catch(e) {
     console.warn('[Sync] 推送失败:', e.message);
@@ -1001,8 +999,8 @@ async function cloudPush(data) {
 function updateSyncUI() {
   const el = document.getElementById('syncIndicator');
   if (!el) return;
-  if (!lcReady) {
-    el.innerHTML = '<span style="color:var(--text-muted);font-size:18px" title="未配置云端同步">&#9724;</span>';
+  if (!fbReady) {
+    el.innerHTML = '<span style="color:var(--text-muted);font-size:18px" title="未配置 Firebase 同步">&#9724;</span>';
     return;
   }
   const states = { local: ['&#9724;', 'var(--text-muted)'], syncing: ['&#8635;', 'var(--accent)'], online: ['&#9673;', 'var(--success)'], offline: ['&#8855;', 'var(--danger)'] };
@@ -1012,8 +1010,8 @@ function updateSyncUI() {
 }
 
 async function manualSync() {
-  if (!lcReady) {
-    showToast('请先配置 LeanCloud 密钥');
+  if (!fbReady) {
+    showToast('请先配置 Firebase 密钥');
     return;
   }
   syncStatus = 'syncing'; updateSyncUI();
@@ -1097,7 +1095,7 @@ function loadData() {
 
 function saveData() {
   localStorage.setItem(STORAGE_KEY, JSON.stringify(appData));
-  if (lcReady) { cloudPush(appData).catch(function(){}); }
+  if (fbReady) { cloudPush(appData).catch(function(){}); }
 }
 
 function getCurrentProject() {
@@ -1970,13 +1968,13 @@ loadData();
 if (!appData.currentProjectId && appData.projects.length > 0) {
   appData.currentProjectId = appData.projects[0].id;
 }
-initLC();
+initFB();
 renderAll();
 handleResize();
 
 // 启动时自动从云端拉取一次
 (async function() {
-  if (lcReady) {
+  if (fbReady) {
     const cloudData = await cloudPull();
     if (cloudData) {
       appData = cloudData;
@@ -1994,7 +1992,7 @@ handleResize();
   }
 })();
 
-console.log('Kanban v3.2 OA Edition + Cloud Sync');
+console.log('Kanban v3.3 Firebase Edition + Cloud Sync');
 </script>
 </body>
 </html>

@@ -9,6 +9,7 @@
 <meta name="apple-mobile-web-app-status-bar-style" content="default">
 <meta name="apple-mobile-web-app-title" content="项目管理看板">
 <meta name="theme-color" content="#f6f8fb">
+<script src="https://cdn.jsdelivr.net/npm/leancloud-storage@4/dist/av-min.js"></script>
 <style>
 /* ========== CSS Variables ========== */
 :root {
@@ -705,6 +706,7 @@ input, textarea, select { font-family: inherit; font-size: inherit; }
     <button class="project-settings-btn" onclick="openProjectModal()" title="项目管理">&#9881;</button>
   </div>
   <div class="header-actions">
+    <button class="header-btn btn-secondary" onclick="manualSync()" id="syncIndicator" title="云端同步">&#9724;</button>
     <button class="header-btn btn-report" onclick="openWeeklyReport()">周报</button>
     <button class="header-btn btn-secondary" onclick="openMemberModal()"><span id="memberBtnLabel">成员</span></button>
     <button class="header-btn btn-primary" onclick="openCardModal()">+ 新建任务</button>
@@ -928,6 +930,110 @@ const STORAGE_KEY = 'kanban_board_v3';
 const STATUS_LABELS = { todo: '待办', progress: '进行中', done: '已完成' };
 const ROLE_LABELS = { manager: '项目主管', implementer: '实施人员' };
 
+// ===================== LEANCLOUD CLOUD SYNC =====================
+// 去 leancloud.cn 免费注册 → 创建应用 → 设置 → 应用 Keys 复制下面三项
+const LC_CONFIG = {
+  appId: 'YOUR_LEANCLOUD_APP_ID',
+  appKey: 'YOUR_LEANCLOUD_APP_KEY',
+  serverURL: 'https://YOUR_LC_ID.lc-cn-n1-shared.com'
+};
+
+let lcReady = false;
+let syncStatus = 'local'; // 'local' | 'syncing' | 'online' | 'offline'
+
+function initLC() {
+  if (!LC_CONFIG.appId || LC_CONFIG.appId.startsWith('YOUR_')) {
+    console.log('[Sync] 未配置 LeanCloud，仅本地存储');
+    updateSyncUI();
+    return;
+  }
+  try {
+    AV.init({ appId: LC_CONFIG.appId, appKey: LC_CONFIG.appKey, serverURL: LC_CONFIG.serverURL });
+    lcReady = true;
+    console.log('[Sync] LeanCloud 已就绪');
+  } catch(e) {
+    console.warn('[Sync] 初始化失败:', e.message);
+  }
+  updateSyncUI();
+}
+
+async function cloudPull() {
+  if (!lcReady) return null;
+  try {
+    syncStatus = 'syncing'; updateSyncUI();
+    const q = new AV.Query('KanbanData');
+    q.equalTo('syncKey', 'main');
+    q.descending('updatedAt');
+    const row = await q.first();
+    if (row && row.get('payload')) {
+      try { return JSON.parse(row.get('payload')); }
+      catch(_) { return null; }
+    }
+    return null;
+  } catch(e) {
+    console.warn('[Sync] 拉取失败:', e.message);
+    syncStatus = 'offline'; updateSyncUI();
+    return null;
+  } finally {
+    if (syncStatus === 'syncing') { syncStatus = 'online'; updateSyncUI(); }
+  }
+}
+
+async function cloudPush(data) {
+  if (!lcReady) return;
+  try {
+    const q = new AV.Query('KanbanData');
+    q.equalTo('syncKey', 'main');
+    let row = await q.first();
+    if (!row) {
+      row = new AV.Object('KanbanData');
+      row.set('syncKey', 'main');
+    }
+    row.set('payload', JSON.stringify(data));
+    await row.save();
+    syncStatus = 'online'; updateSyncUI();
+  } catch(e) {
+    console.warn('[Sync] 推送失败:', e.message);
+    syncStatus = 'offline'; updateSyncUI();
+  }
+}
+
+function updateSyncUI() {
+  const el = document.getElementById('syncIndicator');
+  if (!el) return;
+  if (!lcReady) {
+    el.innerHTML = '<span style="color:var(--text-muted);font-size:18px" title="未配置云端同步">&#9724;</span>';
+    return;
+  }
+  const states = { local: ['&#9724;', 'var(--text-muted)'], syncing: ['&#8635;', 'var(--accent)'], online: ['&#9673;', 'var(--success)'], offline: ['&#8855;', 'var(--danger)'] };
+  const [icon, color] = states[syncStatus] || states.local;
+  const titles = { local:'本地模式', syncing:'同步中...', online:'云端已同步', offline:'同步失败' };
+  el.innerHTML = '<span style="color:' + color + ';font-size:16px;font-weight:bold" title="' + (titles[syncStatus]||'') + '">' + icon + '</span>';
+}
+
+async function manualSync() {
+  if (!lcReady) {
+    showToast('请先配置 LeanCloud 密钥');
+    return;
+  }
+  syncStatus = 'syncing'; updateSyncUI();
+  const cloudData = await cloudPull();
+  if (cloudData) {
+    appData = cloudData;
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(appData));
+    if (!appData.currentProjectId && appData.projects.length > 0) {
+      appData.currentProjectId = appData.projects[0].id;
+    }
+    renderAll();
+    if (window.innerWidth <= 768) switchMobileTab(activeMobileTab);
+    showToast('已从云端同步');
+  } else {
+    await cloudPush(appData);
+    syncStatus = 'online'; updateSyncUI();
+    showToast('已上传至云端');
+  }
+}
+
 let appData = {
   currentProjectId: null,
   projects: []
@@ -991,6 +1097,7 @@ function loadData() {
 
 function saveData() {
   localStorage.setItem(STORAGE_KEY, JSON.stringify(appData));
+  if (lcReady) { cloudPush(appData).catch(function(){}); }
 }
 
 function getCurrentProject() {
@@ -1863,10 +1970,31 @@ loadData();
 if (!appData.currentProjectId && appData.projects.length > 0) {
   appData.currentProjectId = appData.projects[0].id;
 }
+initLC();
 renderAll();
 handleResize();
 
-console.log('Kanban v3 OA Edition');
+// 启动时自动从云端拉取一次
+(async function() {
+  if (lcReady) {
+    const cloudData = await cloudPull();
+    if (cloudData) {
+      appData = cloudData;
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(appData));
+      if (!appData.currentProjectId && appData.projects.length > 0) {
+        appData.currentProjectId = appData.projects[0].id;
+      }
+      renderAll();
+      if (window.innerWidth <= 768) switchMobileTab(activeMobileTab);
+      console.log('[Sync] 启动同步完成，已加载云端数据');
+    } else {
+      await cloudPush(appData);
+      console.log('[Sync] 已将本地数据推送至云端');
+    }
+  }
+})();
+
+console.log('Kanban v3.2 OA Edition + Cloud Sync');
 </script>
 </body>
 </html>
